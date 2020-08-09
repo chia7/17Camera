@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Camera</string>
+    <string name="capture_button">Camera Capture Button</string>
+    <string name="flip_button">Camera Flip Button</string>
+</resources>

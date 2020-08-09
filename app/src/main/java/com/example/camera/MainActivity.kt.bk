@@ -1,0 +1,507 @@
+package com.example.camera
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
+import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.Image
+import android.media.ImageReader
+import android.media.ImageReader.OnImageAvailableListener
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import android.util.Size
+import android.view.Surface
+import android.view.TextureView
+import android.widget.ImageView
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.util.*
+
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var captureBtn: ImageView
+    private lateinit var flipBtn: ImageView
+    private lateinit var textureView: TextureView
+
+
+    private lateinit var cameraId: String
+    private lateinit var cameraDevice: CameraDevice
+    private lateinit var cameraMap: StreamConfigurationMap
+    private lateinit var captureSession: CameraCaptureSession
+    private lateinit var previewRequestBuilder: CaptureRequest.Builder
+    private lateinit var previewRequest: CaptureRequest
+    private var flashSupport = false
+    private var hasLensFacingFront = false
+    private var lensFacingFront = false
+
+
+    private val STATE_PREVIEW = 0
+    private val STATE_WAITING_LOCK = 1
+    private val STATE_WAITING_PRECAPTURE = 2
+    private val STATE_WAITING_NON_PRECAPTURE = 3
+    private val STATE_PICTURE_TAKEN = 4
+
+    private var cameraState = STATE_PREVIEW
+
+
+//    private val ORIENTATIONS = SparseIntArray(4)
+//
+//    static
+//    {
+//        ORIENTATIONS.append(Surface.ROTATION_0, 90)
+//        ORIENTATIONS.append(Surface.ROTATION_90, 0)
+//        ORIENTATIONS.append(Surface.ROTATION_180, 270)
+//        ORIENTATIONS.append(Surface.ROTATION_270, 180)
+//    }
+
+
+    private lateinit var imgDim: Size
+    private lateinit var imageReader: ImageReader
+    private lateinit var file: File
+    private lateinit var backgroundThread: HandlerThread
+    private lateinit var backgroundHandler: Handler
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+
+        textureView = findViewById<TextureView>(R.id.textureView)
+        captureBtn = findViewById<ImageView>(R.id.captureBtn)
+        flipBtn = findViewById<ImageView>(R.id.flipBtn)
+
+        captureBtn.setOnClickListener { takePicture() }
+        flipBtn.setOnClickListener {
+//            Toast.makeText(this, "Before: $hasLensFacingFront, $lensFacingFront, $cameraId", Toast.LENGTH_SHORT).show()
+            switchCamera()
+//            Toast.makeText(this, "After: $hasLensFacingFront, $lensFacingFront, $cameraId", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val surfaceListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureSizeChanged(p0: SurfaceTexture, p1: Int, p2: Int) {
+        }
+
+        override fun onSurfaceTextureUpdated(p0: SurfaceTexture) = Unit
+
+        override fun onSurfaceTextureDestroyed(p0: SurfaceTexture) = true
+
+        override fun onSurfaceTextureAvailable(p0: SurfaceTexture, p1: Int, p2: Int) {
+            openCamera()
+        }
+
+    }
+
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        if (requestCode == 100) {
+            if (grantResults[0] == PackageManager.PERMISSION_DENIED) {
+                Toast.makeText(
+                    applicationContext,
+                    "Camera and Storage Access Required!",
+                    Toast.LENGTH_LONG
+                ).show()
+                checkCameraPermission()
+            }
+        }
+
+    }
+
+    private fun checkCameraPermission() {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) != PackageManager.PERMISSION_GRANTED
+            && ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(
+                    Manifest.permission.CAMERA,
+                    Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ), 100
+            )
+        } else {
+            connectCamera()
+        }
+    }
+
+    private val cameraManger by lazy {
+        getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    }
+
+    private fun chooseCamera(faceFront: Boolean) {
+        try {
+            for (id in cameraManger.cameraIdList) {
+                //获取相机的相关参数
+                var characteristics = cameraManger.getCameraCharacteristics(id)
+                // 不使用前置摄像头。
+                var facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+
+                if (faceFront) {
+                    if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                        continue
+                    }
+                } else {
+                    if (facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                        hasLensFacingFront = true
+                        continue
+                    }
+                }
+                var map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                if (map == null) {
+                    continue
+                }
+                cameraMap = map
+                imgDim = map.getOutputSizes(ImageFormat.YUV_420_888)[0]
+                // 检查闪光灯是否支持。
+
+
+                var jpegSize = cameraMap.getOutputSizes(ImageFormat.JPEG)[0]
+                imageReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2)
+                imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
+
+
+                var available = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+                if (available != null) {
+                    flashSupport = available
+                }
+                cameraId = id
+            }
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        } catch (e: NullPointerException) {
+            //不支持Camera2API
+        }
+    }
+
+    private fun switchCamera() {
+        if (!hasLensFacingFront) return
+
+        lensFacingFront = !lensFacingFront
+        chooseCamera(lensFacingFront)
+        closeCamera()
+        openCamera()
+    }
+
+    private val deviceStateCallBack = object : CameraDevice.StateCallback() {
+        override fun onOpened(p0: CameraDevice) {
+            if (p0 != null) {
+                cameraDevice = p0
+                cameraPreview()
+            }
+        }
+
+        override fun onDisconnected(p0: CameraDevice) {
+            p0.close()
+        }
+
+        override fun onError(p0: CameraDevice, p1: Int) {
+            this@MainActivity.finish()
+        }
+
+    }
+
+    private fun cameraPreview() {
+        val surfaceTexture = textureView.surfaceTexture
+        surfaceTexture?.setDefaultBufferSize(imgDim.width, imgDim.height)
+        val surface = Surface(surfaceTexture)
+
+        previewRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+        previewRequestBuilder.addTarget(surface)
+
+        cameraDevice.createCaptureSession(Arrays.asList(surface),
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigureFailed(p0: CameraCaptureSession) {
+                }
+
+                override fun onConfigured(p0: CameraCaptureSession) {
+                    if (p0 != null) {
+                        captureSession = p0
+                        previewRequestBuilder.set(
+                            CaptureRequest.CONTROL_AF_MODE,
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                        )
+                        previewRequest = previewRequestBuilder.build()
+                        captureSession.setRepeatingRequest(previewRequest, null, null)
+                    }
+
+                }
+
+            }, null
+        )
+    }
+
+    private fun connectCamera() {
+        chooseCamera(lensFacingFront)
+        try {
+            cameraManger.openCamera(cameraId, deviceStateCallBack, backgroundHandler)
+        } catch (e: CameraAccessException) {
+        } catch (e: InterruptedException) {
+        }
+    }
+
+    private fun openCamera() {
+        checkCameraPermission()
+    }
+
+    private fun closeCamera() {
+        if (this::captureSession.isInitialized) {
+            captureSession.close()
+        }
+        if (this::cameraDevice.isInitialized) {
+            cameraDevice.close()
+        }
+    }
+
+    private val captureCallback = object: CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            super.onCaptureCompleted(session, request, result)
+
+            when (cameraState) {
+                STATE_WAITING_LOCK -> {
+                    //等待对焦
+                    var afState = result.get(CaptureResult.CONTROL_AF_STATE)
+
+                    Log.e("TAG", "here: $afState" );
+
+                    if (afState == null) {
+                        captureStillPicture()
+                    } else if (CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED == afState ||
+                        CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED == afState) {
+                        // CONTROL_AE_STATE can be null on some devices
+                        var aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                        if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
+                            cameraState = STATE_WAITING_NON_PRECAPTURE
+                            //对焦完成
+                            captureStillPicture()
+                        } else {
+                            runPrecaptureSequence()
+                        }
+                    }
+                }
+                STATE_WAITING_PRECAPTURE -> {
+                    // CONTROL_AE_STATE can be null on some devices
+                    var aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                    if (aeState == null || aeState == CaptureResult.CONTROL_AE_STATE_PRECAPTURE
+                        || aeState == CaptureRequest.CONTROL_AE_STATE_FLASH_REQUIRED) {
+                        cameraState = STATE_WAITING_NON_PRECAPTURE
+                    }
+                }
+                STATE_WAITING_NON_PRECAPTURE -> {
+                    var aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                    if (aeState == null || aeState != CaptureResult.CONTROL_AE_STATE_PRECAPTURE) {
+                        cameraState = STATE_PICTURE_TAKEN
+                        captureStillPicture()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun runPrecaptureSequence() {
+        try {
+            // 这是如何告诉相机触发的。
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+            // 告诉 mCaptureCallback 等待preapture序列被设置.
+            cameraState = STATE_WAITING_PRECAPTURE
+            captureSession.capture(previewRequestBuilder.build(), captureCallback,backgroundHandler)
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun captureStillPicture() {
+        try {
+            // 这是用来拍摄照片的CaptureRequest.Builder。
+            val captureBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+            captureBuilder.addTarget(imageReader.surface)
+
+            // 使用相同的AE和AF模式作为预览。
+            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            setAutoFlash(captureBuilder)
+
+            // 方向
+            val rotation = this.windowManager.defaultDisplay.rotation
+//            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation))
+
+            val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    unlockFocus()
+                }
+            }
+            //停止连续取景
+            captureSession.stopRepeating()
+            //捕获图片
+            captureSession.capture(captureBuilder.build(), captureCallback, null)
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun setAutoFlash(requestBuilder: CaptureRequest.Builder) {
+        if (flashSupport) {
+            requestBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH)
+        }
+    }
+
+    private fun lockFocus() {
+        try {
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+
+            file = File(Environment.getStorageDirectory(), "pic.jpg")
+
+            cameraState = STATE_WAITING_LOCK;
+            captureSession.capture(previewRequestBuilder.build(), captureCallback, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun unlockFocus() {
+        try {
+            // 重置自动对焦
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+            setAutoFlash(previewRequestBuilder)
+            captureSession.capture(previewRequestBuilder.build(), captureCallback, backgroundHandler)
+            // 将相机恢复正常的预览状态。
+            cameraState = STATE_PREVIEW
+            // 打开连续取景模式
+            captureSession.setRepeatingRequest(previewRequest, captureCallback, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+    }
+
+
+
+    private val onImageAvailableListener =
+        OnImageAvailableListener { reader -> //当图片可得到的时候获取图片并保存
+            backgroundHandler.post(ImageSaver(reader.acquireLatestImage(), file))
+        }
+
+
+    private fun takePicture() {
+//        try {
+////            var characteristics = cameraManger.getCameraCharacteristics(cameraId)
+////            var map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+//            var jpegSize = cameraMap.getOutputSizes(ImageFormat.JPEG)[0]
+//
+//            imageReader = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 1)
+//            imageReader.setOnImageAvailableListener(onImageAvailableListener, backgroundHandler)
+//
+//            var outputSurface = ArrayList<Surface>(2)
+//            outputSurface.add(imageReader.surface)
+//            outputSurface.add(Surface(textureView.surfaceTexture))
+//
+//            var tsLong = System.currentTimeMillis() / 1000
+//            var ts = tsLong.toString()
+//
+//            var file = File(Environment.getStorageDirectory() + "/" + ts + ".jpg")
+//
+//        } catch (e: CameraAccessException) {
+//
+//        }
+        lockFocus()
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        startBackgroundThread()
+        if(textureView.isAvailable) {
+            openCamera()
+        } else {
+            textureView.surfaceTextureListener = surfaceListener
+        }
+    }
+
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("Kotlin Camera2").also { it.start() }
+        backgroundHandler = Handler(backgroundThread.looper)
+
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread.quitSafely()
+        try {
+            backgroundThread.join()
+        } catch (e: InterruptedException) {
+        }
+    }
+
+    override fun onPause() {
+        closeCamera()
+        stopBackgroundThread()
+        super.onPause()
+    }
+
+    private class ImageSaver(image: Image, file: File) : Runnable {
+        /**
+         * JPEG图像
+         */
+        private val mImage: Image
+
+        /**
+         * 保存图像的文件
+         */
+        private val mFile: File
+        override fun run() {
+            val buffer: ByteBuffer = mImage.planes.get(0).buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            var output: FileOutputStream? = null
+            try {
+                output = FileOutputStream(mFile)
+                output.write(bytes)
+
+                Log.e("TAG", "Save Pic" );
+
+            } catch (e: IOException) {
+                e.printStackTrace()
+            } finally {
+                mImage.close()
+                if (null != output) {
+                    try {
+                        output.close()
+                    } catch (e: IOException) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+
+        init {
+            mImage = image
+            mFile = file
+        }
+    }
+}
